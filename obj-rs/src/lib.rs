@@ -32,7 +32,7 @@ pub use crate::error::{LoadError, LoadErrorKind, ObjError, ObjResult};
 
 use crate::error::{index_out_of_range, make_error};
 use crate::raw::object::Polygon;
-use num_traits::FromPrimitive;
+use num_traits::{FromPrimitive, ToPrimitive};
 use std::collections::hash_map::{Entry, HashMap};
 use std::io::BufRead;
 
@@ -50,6 +50,89 @@ use vulkano::impl_vertex;
 pub fn load_obj<V: FromRawVertex<I>, T: BufRead, I>(input: T) -> ObjResult<Obj<V, I>> {
     let raw = raw::parse_obj(input)?;
     Obj::new(raw)
+}
+
+/// Triangulate the polygon using the earcut algorithm
+/// This function accept the vertex buffer and the indexes of the polygon to triangulate
+fn triangulate<I: ToPrimitive + Copy>(polygon_indexes: &[I], vb: &[Vertex]) -> Vec<I> {
+    assert!(polygon_indexes.len() >= 3);
+    let mut result = Vec::new();
+    let mut current_vertex_index = 0;
+    // TODO: remove the clone
+    let mut polygon = Vec::from(polygon_indexes);
+    while polygon.len() > 3 {
+        // take the vertex and the two adjacent ones
+        let previous_index = (current_vertex_index + polygon.len() - 1) % polygon.len();
+        let i0 = polygon[previous_index];
+        let v0: Vertex = vb[i0.to_usize().unwrap()];
+        let i1 = polygon[current_vertex_index];
+        let v1: Vertex = vb[i1.to_usize().unwrap()];
+        let next_index = (current_vertex_index + 1) % polygon.len();
+        let i2 = polygon[next_index];
+        let v2: Vertex = vb[i2.to_usize().unwrap()];
+        // check if the angle is concave
+        // to do so we check that the cross-product of their edges is positive if the polygon is in clockwise order
+        // viceversa if counter-clockwise
+        // to check the order we calculate the area using the shoelace formula and check if it is positive
+        let cross_product = (v1.position[0] - v0.position[0]) * (v2.position[1] - v1.position[1])
+            - (v1.position[1] - v0.position[1]) * (v2.position[0] - v1.position[0]);
+        let area = 0.5 * (v0.position[0] * v1.position[1] - v1.position[0] * v0.position[1]);
+        if cross_product * area < 0.0 {
+            // with reflex angles the triangle is an ear
+            current_vertex_index = next_index;
+            continue;
+        }
+        // check if this triangle contains any other vertex
+        let mut index = (next_index + 1) % polygon.len();
+        let mut contains_any_other_triangle = false;
+        while index < previous_index {
+            let i = polygon[index];
+            let vertex_to_check: Vertex = vb[i.to_usize().unwrap()];
+            // to check if the vertex is inside the triangle the dot products of every triangle's side normal and the point have the same sign
+            // to calculate the normal we simply rotate the side vector by 90 degrees (x, y) -> (-y, x)
+            let v0_to_v1 = [
+                v0.position[1] - v1.position[1],
+                v1.position[0] - v0.position[0],
+            ];
+            let v1_to_v2 = [
+                v1.position[1] - v2.position[1],
+                v2.position[0] - v1.position[0],
+            ];
+            let v2_to_v0 = [
+                v2.position[1] - v1.position[1],
+                v0.position[0] - v2.position[0],
+            ];
+            let dot_side0 = v0_to_v1[0] * vertex_to_check.position[0]
+                + v0_to_v1[1] * vertex_to_check.position[1];
+            let dot_side1 = v1_to_v2[0] * vertex_to_check.position[0]
+                + v1_to_v2[1] * vertex_to_check.position[1];
+            let dot_side2 = v2_to_v0[0] * vertex_to_check.position[0]
+                + v2_to_v0[1] * vertex_to_check.position[1];
+            if dot_side0 * dot_side1 > 0.0 && dot_side1 * dot_side2 > 0.0 {
+                contains_any_other_triangle = true;
+                break;
+            }
+            index = (index + 1) % polygon.len();
+        }
+        if contains_any_other_triangle {
+            // if the triangle contains any other vertex is not an ear
+            current_vertex_index = next_index;
+            continue;
+        }
+
+        // otherwise it is an ear, add its vertex indexes to the result and remove the current vertice from the polygon
+        // remove v1 from the polygon
+        polygon.remove(current_vertex_index);
+        // add the list of the three vertices to the result
+        result.push(i0);
+        result.push(i1);
+        result.push(i2);
+        // in case we remove the last vertex we should point now to the first, otherwise we point to the one previously indexed by `next_index`
+        current_vertex_index = current_vertex_index % polygon.len();
+    }
+    // only three vertices left, add all of them to the result vertex indexes
+    result.append(&mut polygon);
+    result
 }
 
 /// 3D model object loaded from wavefront OBJ.
@@ -106,68 +189,120 @@ implement_vertex!(Vertex, position, normal);
 #[cfg(feature = "vulkano")]
 impl_vertex!(Vertex, position, normal);
 
-impl<I: FromPrimitive + Copy> FromRawVertex<I> for Vertex {
+struct VertexBufferCache<I: ToPrimitive + FromPrimitive + Copy> {
+    positions: Vec<(f32, f32, f32, f32)>,
+    normals: Vec<(f32, f32, f32)>,
+    tex_coord: Vec<(f32, f32, f32)>,
+    cache: HashMap<(usize, usize), I>,
+    vb: Vec<Vertex>,
+    ib: Vec<I>,
+}
+
+struct VertexIndex {
+    pi: usize,
+    ni: usize,
+}
+
+impl From<(usize, usize)> for VertexIndex {
+    fn from((pi, ni): (usize, usize)) -> Self {
+        VertexIndex { pi, ni }
+    }
+}
+
+impl From<(usize, usize, usize)> for VertexIndex {
+    fn from((pi, _, ni): (usize, usize, usize)) -> Self {
+        VertexIndex { pi, ni }
+    }
+}
+
+impl<I: ToPrimitive + FromPrimitive + Copy> VertexBufferCache<I> {
+    fn new(
+        positions: Vec<(f32, f32, f32, f32)>,
+        normals: Vec<(f32, f32, f32)>,
+        tex_coord: Vec<(f32, f32, f32)>,
+        n_polygons: usize,
+    ) -> Self {
+        VertexBufferCache {
+            positions,
+            normals,
+            tex_coord,
+            cache: HashMap::new(),
+            vb: Vec::with_capacity(n_polygons * 3),
+            ib: Vec::with_capacity(n_polygons * 3),
+        }
+    }
+
+    fn map(&mut self, pi: usize, ni: usize) -> ObjResult<I> {
+        // Look up cache
+        let index = match self.cache.entry((pi, ni)) {
+            // Cache miss -> make new, store it on cache
+            Entry::Vacant(entry) => {
+                // TODO: this cache should accept a generic type V and delegate the conversion from indices to vertices to
+                let p = self.positions[pi];
+                let n = self.normals[ni];
+                let vertex = Vertex {
+                    position: [p.0, p.1, p.2],
+                    normal: [n.0, n.1, n.2],
+                };
+                let index = match I::from_usize(self.vb.len()) {
+                    Some(val) => val,
+                    None => return index_out_of_range::<_, I>(self.vb.len()),
+                };
+                self.vb.push(vertex);
+                entry.insert(index);
+                index
+            }
+            // Cache hit -> use it
+            Entry::Occupied(entry) => *entry.get(),
+        };
+        Ok(index)
+    }
+
+    fn add_polygon(&mut self, vec: Vec<impl Into<VertexIndex>>) -> ObjResult<()> {
+        let mut polygon_indexes = Vec::new();
+        for vi in vec {
+            let vi: VertexIndex = vi.into();
+            polygon_indexes.push(self.map(vi.pi, vi.ni)?);
+        }
+        let vertices = triangulate(polygon_indexes.as_slice(), self.vb.as_slice());
+        self.ib.extend(vertices);
+        Ok(())
+    }
+
+    fn finalize(mut self) -> (Vec<Vertex>, Vec<I>) {
+        self.vb.shrink_to_fit();
+        (self.vb, self.ib)
+    }
+}
+
+impl<I: ToPrimitive + FromPrimitive + Copy> FromRawVertex<I> for Vertex {
     fn process(
         positions: Vec<(f32, f32, f32, f32)>,
         normals: Vec<(f32, f32, f32)>,
-        _: Vec<(f32, f32, f32)>,
+        tex_coord: Vec<(f32, f32, f32)>,
         polygons: Vec<Polygon>,
     ) -> ObjResult<(Vec<Self>, Vec<I>)> {
-        let mut vb = Vec::with_capacity(polygons.len() * 3);
-        let mut ib = Vec::with_capacity(polygons.len() * 3);
-        {
-            let mut cache = HashMap::new();
-            let mut map = |pi: usize, ni: usize| -> ObjResult<()> {
-                // Look up cache
-                let index = match cache.entry((pi, ni)) {
-                    // Cache miss -> make new, store it on cache
-                    Entry::Vacant(entry) => {
-                        let p = positions[pi];
-                        let n = normals[ni];
-                        let vertex = Vertex {
-                            position: [p.0, p.1, p.2],
-                            normal: [n.0, n.1, n.2],
-                        };
-                        let index = match I::from_usize(vb.len()) {
-                            Some(val) => val,
-                            None => return index_out_of_range::<_, I>(vb.len()),
-                        };
-                        vb.push(vertex);
-                        entry.insert(index);
-                        index
-                    }
-                    // Cache hit -> use it
-                    Entry::Occupied(entry) => *entry.get(),
-                };
-                ib.push(index);
-                Ok(())
-            };
+        let mut cache = VertexBufferCache::new(positions, normals, tex_coord, polygons.len());
 
-            for polygon in polygons {
-                match polygon {
-                    Polygon::P(_) | Polygon::PT(_) => make_error!(
-                        InsufficientData,
-                        "Tried to extract normal data which are not contained in the model"
-                    ),
-                    Polygon::PN(ref vec) if vec.len() == 3 => {
-                        for &(pi, ni) in vec {
-                            map(pi, ni)?;
-                        }
-                    }
-                    Polygon::PTN(ref vec) if vec.len() == 3 => {
-                        for &(pi, _, ni) in vec {
-                            map(pi, ni)?;
-                        }
-                    }
-                    _ => make_error!(
-                        UntriangulatedModel,
-                        "Model should be triangulated first to be loaded properly"
-                    ),
+        for polygon in polygons {
+            match polygon {
+                Polygon::P(_) | Polygon::PT(_) => make_error!(
+                    InsufficientData,
+                    "Tried to extract normal data which are not contained in the model"
+                ),
+                Polygon::PN(vec) => {
+                    cache.add_polygon(vec)?;
                 }
+                Polygon::PTN(vec) => {
+                    cache.add_polygon(vec)?;
+                }
+                _ => make_error!(
+                    UntriangulatedModel,
+                    "Model should be triangulated first to be loaded properly"
+                ),
             }
         }
-        vb.shrink_to_fit();
-        Ok((vb, ib))
+        Ok(cache.finalize())
     }
 }
 
