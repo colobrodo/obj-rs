@@ -257,13 +257,13 @@ impl<
     fn new(
         positions: Vec<(f32, f32, f32, f32)>,
         normals: Vec<(f32, f32, f32)>,
-        tex_coord: Vec<(f32, f32, f32)>,
+        tex_coords: Vec<(f32, f32, f32)>,
         n_polygons: usize,
     ) -> Self {
         VertexBufferCache {
             positions,
             normals,
-            tex_coords: tex_coord,
+            tex_coords,
             cache: HashMap::new(),
             vb: Vec::with_capacity(n_polygons * 3),
             ib: Vec::with_capacity(n_polygons * 3),
@@ -426,64 +426,70 @@ pub struct TexturedVertex {
     pub texture: [f32; 3],
 }
 
+impl Point for TexturedVertex {
+    fn position(&self) -> [f32; 3] {
+        [self.position[0], self.position[1], self.position[2]]
+    }
+}
+
+#[derive(Eq, PartialEq, Hash, Copy, Clone)]
+struct TexturedVertexIndex {
+    pi: usize,
+    ni: usize,
+    ti: usize,
+}
+
+impl From<(usize, usize, usize)> for TexturedVertexIndex {
+    fn from((pi, ti, ni): (usize, usize, usize)) -> Self {
+        TexturedVertexIndex { pi, ni, ti }
+    }
+}
+
+impl FromBufferIndexes<TexturedVertexIndex> for TexturedVertex {
+    fn from_buffer_index(
+        positions: &[(f32, f32, f32, f32)],
+        normals: &[(f32, f32, f32)],
+        tex_coords: &[(f32, f32, f32)],
+        vertex_index: TexturedVertexIndex,
+    ) -> Self {
+        let position = positions[vertex_index.pi];
+        let normal = normals[vertex_index.ni];
+        let tex_coord = tex_coords[vertex_index.ti];
+        TexturedVertex {
+            position: [position.0, position.1, position.2],
+            normal: [normal.0, normal.1, normal.2],
+            texture: [tex_coord.0, tex_coord.1, tex_coord.2],
+        }
+    }
+}
+
 #[cfg(feature = "glium")]
 implement_vertex!(TexturedVertex, position, normal, texture);
 #[cfg(feature = "vulkano")]
 impl_vertex!(TexturedVertex, position, normal, texture);
 
-impl<I: FromPrimitive + Copy> FromRawVertex<I> for TexturedVertex {
+impl<I: ToPrimitive + FromPrimitive + Copy> FromRawVertex<I> for TexturedVertex {
     fn process(
         positions: Vec<(f32, f32, f32, f32)>,
         normals: Vec<(f32, f32, f32)>,
         tex_coords: Vec<(f32, f32, f32)>,
         polygons: Vec<Polygon>,
     ) -> ObjResult<(Vec<Self>, Vec<I>)> {
-        let mut vb = Vec::with_capacity(polygons.len() * 3);
-        let mut ib = Vec::with_capacity(polygons.len() * 3);
+        let mut cache = VertexBufferCache::new(positions, normals, tex_coords, polygons.len());
         {
-            let mut cache = HashMap::new();
-            let mut map = |pi: usize, ni: usize, ti: usize| -> ObjResult<()> {
-                // Look up cache
-                let index = match cache.entry((pi, ni, ti)) {
-                    // Cache miss -> make new, store it on cache
-                    Entry::Vacant(entry) => {
-                        let p = positions[pi];
-                        let n = normals[ni];
-                        let t = tex_coords[ti];
-                        let vertex = TexturedVertex {
-                            position: [p.0, p.1, p.2],
-                            normal: [n.0, n.1, n.2],
-                            texture: [t.0, t.1, t.2],
-                        };
-                        let index = match I::from_usize(vb.len()) {
-                            Some(val) => val,
-                            None => return index_out_of_range::<_, I>(vb.len()),
-                        };
-                        vb.push(vertex);
-                        entry.insert(index);
-                        index
-                    }
-                    // Cache hit -> use it
-                    Entry::Occupied(entry) => *entry.get(),
-                };
-                ib.push(index);
-                Ok(())
-            };
-
             for polygon in polygons {
                 match polygon {
                     Polygon::P(_) => make_error!(InsufficientData, "Tried to extract normal and texture data which are not contained in the model"),
                     Polygon::PT(_) => make_error!(InsufficientData, "Tried to extract normal data which are not contained in the model"),
                     Polygon::PN(_) => make_error!(InsufficientData, "Tried to extract texture data which are not contained in the model"),
-                    Polygon::PTN(ref vec) if vec.len() == 3 => {
-                        for &(pi, ti, ni) in vec { map(pi, ni, ti)? }
+                    Polygon::PTN(vec) => {
+                        cache.add_polygon(vec)?;
                     }
                     _ => make_error!(UntriangulatedModel, "Model should be triangulated first to be loaded properly")
                 }
             }
         }
-        vb.shrink_to_fit();
-        Ok((vb, ib))
+        Ok(cache.finalize())
     }
 }
 
