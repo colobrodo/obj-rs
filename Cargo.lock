@@ -736,6 +736,19 @@ dependencies = [
  "backtrace",
  "fnv",
  "gl_generator",
+ "memoffset 0.9.1",
+ "smallvec",
+]
+
+[[package]]
+name = "glium"
+version = "0.36.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cf52ce4f5ce1501bb056627f35484a819e812d1d93f0f3da413676421b1bbe0"
+dependencies = [
+ "backtrace",
+ "fnv",
+ "gl_generator",
  "glutin",
  "glutin-winit",
  "memoffset 0.9.1",
@@ -1309,7 +1322,7 @@ name = "obj-rs"
 version = "0.7.4"
 dependencies = [
  "bytemuck",
- "glium",
+ "glium 0.35.0",
  "num-traits",
  "serde",
  "vulkano",
@@ -1840,7 +1853,7 @@ dependencies = [
 name = "sampleapp"
 version = "0.1.0"
 dependencies = [
- "glium",
+ "glium 0.36.0",
  "obj-rs",
 ]
 
